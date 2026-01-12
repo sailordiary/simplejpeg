@@ -1,17 +1,13 @@
-from typing import Any
-from typing import Text
-from typing import Tuple
-from typing import SupportsInt
-from typing import SupportsFloat
+from typing import Any, Optional, SupportsFloat, SupportsInt, Text, Tuple
+
 import numpy as np
 
-
 def decode_jpeg_header(
-        data: Any,
-        min_height: SupportsInt=0,
-        min_width: SupportsInt=0,
-        min_factor: SupportsFloat=1,
-        strict: bool=True,
+    data: Any,
+    min_height: SupportsInt = 0,
+    min_width: SupportsInt = 0,
+    min_factor: SupportsFloat = 1,
+    strict: bool = True,
 ) -> Tuple[SupportsInt, SupportsInt, Text, Text]:
     """
     Decode the header of a JPEG image.
@@ -29,23 +25,30 @@ def decode_jpeg_header(
                     decode; default 1
         strict: if True, raise ValueError for recoverable errors;
                 default True
+        roi: Optional region of interest as (x, y, width, height) tuple.
+             If specified, only decode this region. Requires libjpeg-turbo 3.x.
+             Coordinates are in pixels at the output scale.
+        roi_adjust: If True (default), automatically adjust x coordinate to
+                    nearest iMCU boundary for optimal performance.
+                    The output will be cropped to the exact requested region.
 
     Returns:
         height, width, colorspace, color subsampling
     """
-    return 0, 0, 'rgb', '444'
-
+    return 0, 0, "rgb", "444"
 
 def decode_jpeg(
-        data: Any,
-        colorspace: Text='rgb',
-        fastdct: Any=False,
-        fastupsample: Any=False,
-        min_height: SupportsInt=0,
-        min_width: SupportsInt=0,
-        min_factor: SupportsFloat=1,
-        buffer: Any=None,
-        strict: bool=True,
+    data: Any,
+    colorspace: Text = "rgb",
+    fastdct: Any = False,
+    fastupsample: Any = False,
+    min_height: SupportsInt = 0,
+    min_width: SupportsInt = 0,
+    min_factor: SupportsFloat = 1,
+    buffer: Any = None,
+    strict: bool = True,
+    roi: Optional[Tuple[int, int, int, int]] = None,
+    roi_adjust: bool = True,
 ) -> np.ndarray:
     """
     Decode a JPEG (JFIF) string.
@@ -82,13 +85,12 @@ def decode_jpeg(
     """
     return np.empty((1, 1, 1))
 
-
 def encode_jpeg(
-        image: np.ndarray,
-        quality: SupportsInt=85,
-        colorspace: Text='rgb',
-        colorsubsampling: Text='444',
-        fastdct: Any=False,
+    image: np.ndarray,
+    quality: SupportsInt = 85,
+    colorspace: Text = "rgb",
+    colorsubsampling: Text = "444",
+    fastdct: Any = False,
 ) -> bytes:
     """
     Encode an image to JPEG (JFIF) string.
@@ -108,15 +110,14 @@ def encode_jpeg(
     Returns:
         encoded image as JPEG (JFIF) data
     """
-    return b''
-
+    return b""
 
 def encode_jpeg_yuv_planes(
-        Y: np.ndarray,
-        U: np.ndarray | None,
-        V: np.ndarray | None,
-        quality: SupportsInt=85,
-        fastdct: Any=False,
+    Y: np.ndarray,
+    U: np.ndarray | None,
+    V: np.ndarray | None,
+    quality: SupportsInt = 85,
+    fastdct: Any = False,
 ) -> bytes:
     """
     Encode an image in a YUV planar format to JPEG (JFIF) string.

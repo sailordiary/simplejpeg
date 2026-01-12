@@ -41,6 +41,18 @@ cdef extern from "turbojpeg.h" nogil:
     # TJ error enum
     cdef int TJERR_WARNING, TJERR_FATAL
 
+    # TJ init constants for 3.x API
+    cdef int TJINIT_DECOMPRESS
+    cdef int TJINIT_COMPRESS
+
+    # TJ parameter constants for 3.x API
+    cdef int TJPARAM_FASTDCT
+    cdef int TJPARAM_FASTUPSAMPLE
+    cdef int TJPARAM_JPEGWIDTH
+    cdef int TJPARAM_JPEGHEIGHT
+    cdef int TJPARAM_SUBSAMP
+    cdef int TJPARAM_COLORSPACE
+
     cdef tjhandle tjInitDecompress()
 
     cdef tjhandle tjInitCompress()
@@ -111,6 +123,55 @@ cdef extern from "turbojpeg.h" nogil:
     cdef tjscalingfactor* tjGetScalingFactors(int* numscalingfactors)
 
     cdef int TJSCALED(int dimension, tjscalingfactor scalingFactor)
+
+    # 3.x API functions and types for RoI decoding
+    cdef tjhandle tj3Init(int initType)
+
+    cdef void tj3Destroy(tjhandle handle)
+
+    cdef char* tj3GetErrorStr(tjhandle handle)
+
+    cdef int tj3GetErrorCode(tjhandle handle)
+
+    cdef int tj3Set(tjhandle handle, int param, int value)
+
+    cdef int tj3Get(tjhandle handle, int param)
+
+    cdef int tj3DecompressHeader(
+        tjhandle handle,
+        const unsigned char * jpegBuf,
+        unsigned long jpegSize
+    )
+
+    cdef int tj3SetCroppingRegion(
+        tjhandle handle,
+        tjregion croppingRegion
+    )
+
+    cdef int tj3Decompress8(
+        tjhandle handle,
+        const unsigned char * jpegBuf,
+        unsigned long jpegSize,
+        unsigned char * dstBuf,
+        int pitch,
+        int pixelFormat
+    )
+
+    cdef int tj3SetScalingFactor(
+        tjhandle handle,
+        tjscalingfactor scalingFactor
+    )
+
+    # Cropping region structure for 3.x API
+    ctypedef struct tjregion:
+        int x
+        int y
+        int w
+        int h
+
+    # iMCU size arrays (external global constants from turbojpeg.h)
+    cdef extern int * tjMCUWidth
+    cdef int * tjMCUHeight
 
 
 cdef extern from "_color.h" nogil:
@@ -214,6 +275,31 @@ cdef void calc_height_width(
         width[0] = TJSCALED(width_, fac)
 
 
+@cython.cdivision(True)
+cdef void adjust_roi_to_imcu(
+        int* x,
+        int* w,
+        int subsamp,
+        tjscalingfactor scalingFactor,
+) noexcept nogil:
+    """
+    Adjust x coordinate to nearest iMCU boundary and increase width.
+
+    Args:
+        x: Pointer to x coordinate (will be adjusted)
+        w: Pointer to width (will be increased)
+        subsamp: JPEG subsampling constant
+        scalingFactor: Current scaling factor
+    """
+    cdef int mcu_width = tjMCUWidth[subsamp]
+    cdef int scaled_mcu_width = TJSCALED(mcu_width, scalingFactor)
+
+    # Adjust x down to nearest iMCU boundary
+    cdef int adjustment = x[0] % scaled_mcu_width
+    x[0] -= adjustment
+    w[0] += adjustment
+
+
 def decode_jpeg_header(
         const unsigned char[:] data not None,
         int min_height=0,
@@ -290,6 +376,8 @@ def decode_jpeg(
         float min_factor=1,
         buffer=None,
         bint strict=True,
+        tuple roi=None,
+        bint roi_adjust=True,
 ):
     """
     Decode a JPEG (JFIF) string.
@@ -320,6 +408,12 @@ def decode_jpeg(
                 if image dimensions are unknown
         strict: if True, raise ValueError for recoverable errors;
                 default True
+        roi: Optional region of interest as (x, y, width, height) tuple.
+             If specified, only decode this region. Requires libjpeg-turbo 3.x.
+             Coordinates are in pixels at the output scale.
+        roi_adjust: If True (default), automatically adjust x coordinate to
+                    nearest iMCU boundary for optimal performance.
+                    The output will be cropped to the exact requested region.
 
     Returns:
         image as numpy array
@@ -332,117 +426,306 @@ def decode_jpeg(
     cdef int jpegSubsamp
     cdef int jpegColorspace
     cdef tjhandle decoder
-    with nogil:
-        decoder = tjInitDecompress()
-        if decoder == NULL:
-            raise RuntimeError('could not create JPEG decoder')
-        retcode = tjDecompressHeader3(
-            decoder,
-            data_p,
-            data_len,
-            &width,
-            &height,
-            &jpegSubsamp,
-            &jpegColorspace
-        )
-        if retcode != 0:
-            with gil:
-                msg = __tj_error(decoder)
-                tjDestroy(decoder)
-                raise ValueError(msg)
-        calc_height_width(&height, &width, min_height, min_width, min_factor)
 
-    # get colorspace constants
-    cdef int tmp_colorspace = PIXELFORMATS[colorspace]
-    cdef int output_colorspace = PIXELFORMATS[colorspace]
-    cdef bint is_cmyk = 0
-    # check whether JPEG is in CMYK/YCCK colorspace
-    if jpegColorspace == TJCS_CMYK or jpegColorspace == TJCS_YCCK:
-        tmp_colorspace = TJPF_CMYK
-        is_cmyk = 1
+    # RoI parameter validation
+    cdef int roi_x = 0, roi_y = 0, roi_w = 0, roi_h = 0
+    cdef int original_roi_x = 0, original_roi_w = 0
+    cdef bint use_roi = False
 
-    # some variables that may be needed
-    cdef np.npy_intp outlen = height * width * tjPixelSize[output_colorspace]
+    # Additional C variables for RoI path (declared at function scope)
+    cdef int orig_width, orig_height, offset_x
+    cdef int numscalingfactors, i
+    cdef tjscalingfactor scalingFactor
+    cdef tjscalingfactor* factors
+    cdef tjregion cropRegion
+    cdef int tmp_colorspace, output_colorspace
+    cdef bint is_cmyk
+    cdef np.npy_intp outlen, bufferlen
     cdef np.ndarray[np.uint8_t, ndim = 3] tmp
     cdef np.ndarray[np.uint8_t, ndim = 3] out
     cdef unsigned char* tmp_p
     cdef unsigned char* out_p
     cdef Py_buffer view
-    cdef np.npy_intp bufferlen = 0
-
-    # no buffer is given, make new output array
-    cdef np.npy_intp * dims = [height, width, tjPixelSize[output_colorspace]]
-    if buffer is None:
-        out = np.PyArray_EMPTY(3, dims, np.NPY_UINT8, 0)
-        out_p = &out[0, 0, 0]
-    # attempt to create output array from given buffer
-    else:
-        if PyObject_GetBuffer(buffer, &view, DECODE_BUFFER_FLAGS) != 0:
-            raise ValueError('buffer object must support buffer interface '
-                             'and must be writable and contiguous')
-        # check memoryview size and extract pointer
-        bufferlen = view.len
-        if bufferlen < outlen:
-            PyBuffer_Release(&view)
-            raise ValueError('%d byte buffer is too small to decode (%d, %d, %d) image'
-                             % (bufferlen, height, width, tjPixelSize[output_colorspace]))
-        out = np.frombuffer(
-            buffer, np.uint8, outlen
-        ).reshape((height, width, tjPixelSize[output_colorspace]))
-        out_p = <unsigned char*> view.buf
-        PyBuffer_Release(&view)
-
-    # if temp is not output colorspace temporary array must be created
-    if tmp_colorspace != output_colorspace:
-        dims[:] = [height, width, tjPixelSize[tmp_colorspace]]
-        tmp = np.PyArray_EMPTY(3, dims, np.NPY_UINT8, 0)
-        tmp_p = &tmp[0, 0, 0]
-    # otherwise use output array as temp array
-    else:
-        tmp_p = out_p
-
-    # decode image
     cdef int flags
-    with nogil:
-        flags = TJFLAG_NOREALLOC
+    cdef np.npy_intp roi_dims[3]
+    cdef np.npy_intp dims[3]
+
+    if roi is not None:
+        if len(roi) != 4:
+            raise ValueError("roi must be a tuple of 4 integers (x, y, w, h)")
+        roi_x, roi_y, roi_w, roi_h = roi
+        if roi_x < 0 or roi_y < 0:
+            raise ValueError("roi coordinates (x, y) must be non-negative")
+        if roi_w <= 0 or roi_h <= 0:
+            raise ValueError("roi dimensions (w, h) must be positive")
+        use_roi = True
+        original_roi_x = roi_x
+        original_roi_w = roi_w
+
+    # Use 3.x API for RoI decoding
+    if use_roi:
+        # ===== TURBOJPEG 3.x PATH WITH ROI =====
+        with nogil:
+            decoder = tj3Init(TJINIT_DECOMPRESS)
+            if decoder == NULL:
+                raise RuntimeError('could not create JPEG decoder (3.x)')
+
+            retcode = tj3DecompressHeader(decoder, data_p, data_len)
+            if retcode != 0:
+                with gil:
+                    msg = tj3GetErrorStr(decoder)
+                    tj3Destroy(decoder)
+                    raise ValueError(msg)
+
+            # Get image info
+            width = tj3Get(decoder, TJPARAM_JPEGWIDTH)
+            height = tj3Get(decoder, TJPARAM_JPEGHEIGHT)
+            jpegSubsamp = tj3Get(decoder, TJPARAM_SUBSAMP)
+            jpegColorspace = tj3Get(decoder, TJPARAM_COLORSPACE)
+
+        # Determine scaling factor
+        orig_width = width
+        orig_height = height
+        calc_height_width(&height, &width, min_height, min_width, min_factor)
+
+        scalingFactor.num = 1
+        scalingFactor.denom = 1
+        if width != orig_width or height != orig_height:
+            # Find the scaling factor that was used
+            factors = tjGetScalingFactors(&numscalingfactors)
+            for i in range(numscalingfactors):
+                if TJSCALED(orig_width, factors[i]) == width and \
+                   TJSCALED(orig_height, factors[i]) == height:
+                    scalingFactor = factors[i]
+                    break
+
+        # Set scaling factor if needed
+        if scalingFactor.num != scalingFactor.denom:
+            with nogil:
+                retcode = tj3SetScalingFactor(decoder, scalingFactor)
+                if retcode != 0:
+                    with gil:
+                        msg = tj3GetErrorStr(decoder)
+                        tj3Destroy(decoder)
+                        raise ValueError(msg)
+
+        # Adjust RoI to iMCU boundaries if requested
+        if roi_adjust:
+            with nogil:
+                adjust_roi_to_imcu(&roi_x, &roi_w, jpegSubsamp, scalingFactor)
+
+        # Validate and clamp RoI bounds (GIL is already held here)
+        if roi_x >= width or roi_y >= height:
+            tj3Destroy(decoder)
+            raise ValueError(f"RoI ({roi_x}, {roi_y}) is outside image bounds ({width}, {height})")
+        if roi_x + roi_w > width:
+            roi_w = width - roi_x
+        if roi_y + roi_h > height:
+            roi_h = height - roi_y
+
+        # Set cropping region
+        cropRegion.x = roi_x
+        cropRegion.y = roi_y
+        cropRegion.w = roi_w
+        cropRegion.h = roi_h
+
+        with nogil:
+            retcode = tj3SetCroppingRegion(decoder, cropRegion)
+            if retcode != 0:
+                with gil:
+                    msg = tj3GetErrorStr(decoder)
+                    tj3Destroy(decoder)
+                    raise ValueError(msg)
+
+        # Get output colorspace
+        tmp_colorspace = PIXELFORMATS[colorspace]
+        output_colorspace = PIXELFORMATS[colorspace]
+        is_cmyk = 0
+        if jpegColorspace == TJCS_CMYK or jpegColorspace == TJCS_YCCK:
+            tmp_colorspace = TJPF_CMYK
+            is_cmyk = 1
+
+        # Set performance options
         if fastdct:
-            flags |= TJFLAG_FASTDCT
+            tj3Set(decoder, TJPARAM_FASTDCT, 1)
         if fastupsample:
-            flags |= TJFLAG_FASTUPSAMPLE
-        # decompress the image
-        retcode = tjDecompress2(
-            decoder,
-            data_p,
-            data_len,
-            tmp_p,
-            width,
-            0,
-            height,
-            tmp_colorspace,
-            flags
-        )
-        if retcode != 0 and (strict or tjGetErrorCode(decoder) == TJERR_FATAL):
-            with gil:
-                msg = __tj_error(decoder)
-                tjDestroy(decoder)
-                raise ValueError(msg)
-        tjDestroy(decoder)
+            tj3Set(decoder, TJPARAM_FASTUPSAMPLE, 1)
 
-    # JPEG is CMYK color, but output is RGB, apply color conversion
-    if is_cmyk and output_colorspace != TJPF_CMYK:
-        # pre-fill alpha channel
-        if output_colorspace == TJPF_RGBA \
-          or output_colorspace == TJPF_BGRA \
-          or output_colorspace == TJPF_ABGR \
-          or output_colorspace == TJPF_ARGB:
-            np.PyArray_FILLWBYTE(out, 255)
-        if output_colorspace == TJPF_GRAY:
-            cmyk2gray(tmp_p, out_p, height*width)
+        # Allocate output buffer (roi_h x roi_w)
+        outlen = roi_h * roi_w * tjPixelSize[output_colorspace]
+        roi_dims[0] = roi_h
+        roi_dims[1] = roi_w
+        roi_dims[2] = tjPixelSize[output_colorspace]
+
+        if buffer is None:
+            out = np.PyArray_EMPTY(3, roi_dims, np.NPY_UINT8, 0)
+            out_p = &out[0, 0, 0]
         else:
-            cmyk2color(tmp_p, out_p, height*width, output_colorspace)
+            if PyObject_GetBuffer(buffer, &view, DECODE_BUFFER_FLAGS) != 0:
+                raise ValueError('buffer object must support buffer interface '
+                                 'and must be writable and contiguous')
+            bufferlen = view.len
+            if bufferlen < outlen:
+                PyBuffer_Release(&view)
+                raise ValueError('%d byte buffer is too small to decode (%d, %d, %d) image'
+                                 % (bufferlen, roi_h, roi_w, tjPixelSize[output_colorspace]))
+            out = np.frombuffer(
+                buffer, np.uint8, outlen
+            ).reshape((roi_h, roi_w, tjPixelSize[output_colorspace]))
+            out_p = <unsigned char*> view.buf
+            PyBuffer_Release(&view)
 
-    # done
-    return out
+        # if temp is not output colorspace temporary array must be created
+        if tmp_colorspace != output_colorspace:
+            roi_dims[0] = roi_h
+            roi_dims[1] = roi_w
+            roi_dims[2] = tjPixelSize[tmp_colorspace]
+            tmp = np.PyArray_EMPTY(3, roi_dims, np.NPY_UINT8, 0)
+            tmp_p = &tmp[0, 0, 0]
+        else:
+            tmp_p = out_p
+
+        # Decompress
+        with nogil:
+            retcode = tj3Decompress8(
+                decoder, data_p, data_len, tmp_p, 0, tmp_colorspace
+            )
+            if retcode != 0:
+                with gil:
+                    msg = tj3GetErrorStr(decoder)
+                    tj3Destroy(decoder)
+                    raise ValueError(msg)
+            tj3Destroy(decoder)
+
+        # Handle CMYK conversion
+        if is_cmyk and output_colorspace != TJPF_CMYK:
+            if output_colorspace == TJPF_RGBA \
+              or output_colorspace == TJPF_BGRA \
+              or output_colorspace == TJPF_ABGR \
+              or output_colorspace == TJPF_ARGB:
+                np.PyArray_FILLWBYTE(out, 255)
+            if output_colorspace == TJPF_GRAY:
+                cmyk2gray(tmp_p, out_p, roi_h * roi_w)
+            else:
+                cmyk2color(tmp_p, out_p, roi_h * roi_w, output_colorspace)
+
+        # If roi_adjust was True and x was adjusted, crop output to exact region
+        if roi_adjust and roi_x != original_roi_x:
+            offset_x = original_roi_x - roi_x
+            out = out[:, offset_x:offset_x + original_roi_w, :]
+
+        return out
+
+    else:
+        # ===== EXISTING 2.x PATH (no RoI) =====
+        with nogil:
+            decoder = tjInitDecompress()
+            if decoder == NULL:
+                raise RuntimeError('could not create JPEG decoder')
+            retcode = tjDecompressHeader3(
+                decoder,
+                data_p,
+                data_len,
+                &width,
+                &height,
+                &jpegSubsamp,
+                &jpegColorspace
+            )
+            if retcode != 0:
+                with gil:
+                    msg = __tj_error(decoder)
+                    tjDestroy(decoder)
+                    raise ValueError(msg)
+            calc_height_width(&height, &width, min_height, min_width, min_factor)
+
+        # get colorspace constants
+        tmp_colorspace = PIXELFORMATS[colorspace]
+        output_colorspace = PIXELFORMATS[colorspace]
+        is_cmyk = 0
+        # check whether JPEG is in CMYK/YCCK colorspace
+        if jpegColorspace == TJCS_CMYK or jpegColorspace == TJCS_YCCK:
+            tmp_colorspace = TJPF_CMYK
+            is_cmyk = 1
+
+        # some variables that may be needed
+        outlen = height * width * tjPixelSize[output_colorspace]
+
+        # no buffer is given, make new output array
+        dims[0] = height
+        dims[1] = width
+        dims[2] = tjPixelSize[output_colorspace]
+        if buffer is None:
+            out = np.PyArray_EMPTY(3, dims, np.NPY_UINT8, 0)
+            out_p = &out[0, 0, 0]
+        # attempt to create output array from given buffer
+        else:
+            if PyObject_GetBuffer(buffer, &view, DECODE_BUFFER_FLAGS) != 0:
+                raise ValueError('buffer object must support buffer interface '
+                                 'and must be writable and contiguous')
+            # check memoryview size and extract pointer
+            bufferlen = view.len
+            if bufferlen < outlen:
+                PyBuffer_Release(&view)
+                raise ValueError('%d byte buffer is too small to decode (%d, %d, %d) image'
+                                 % (bufferlen, height, width, tjPixelSize[output_colorspace]))
+            out = np.frombuffer(
+                buffer, np.uint8, outlen
+            ).reshape((height, width, tjPixelSize[output_colorspace]))
+            out_p = <unsigned char*> view.buf
+            PyBuffer_Release(&view)
+
+        # if temp is not output colorspace temporary array must be created
+        if tmp_colorspace != output_colorspace:
+            dims[0] = height
+            dims[1] = width
+            dims[2] = tjPixelSize[tmp_colorspace]
+            tmp = np.PyArray_EMPTY(3, dims, np.NPY_UINT8, 0)
+            tmp_p = &tmp[0, 0, 0]
+        # otherwise use output array as temp array
+        else:
+            tmp_p = out_p
+
+        # decode image
+        with nogil:
+            flags = TJFLAG_NOREALLOC
+            if fastdct:
+                flags |= TJFLAG_FASTDCT
+            if fastupsample:
+                flags |= TJFLAG_FASTUPSAMPLE
+            # decompress the image
+            retcode = tjDecompress2(
+                decoder,
+                data_p,
+                data_len,
+                tmp_p,
+                width,
+                0,
+                height,
+                tmp_colorspace,
+                flags
+            )
+            if retcode != 0 and (strict or tjGetErrorCode(decoder) == TJERR_FATAL):
+                with gil:
+                    msg = __tj_error(decoder)
+                    tjDestroy(decoder)
+                    raise ValueError(msg)
+            tjDestroy(decoder)
+
+        # JPEG is CMYK color, but output is RGB, apply color conversion
+        if is_cmyk and output_colorspace != TJPF_CMYK:
+            # pre-fill alpha channel
+            if output_colorspace == TJPF_RGBA \
+              or output_colorspace == TJPF_BGRA \
+              or output_colorspace == TJPF_ABGR \
+              or output_colorspace == TJPF_ARGB:
+                np.PyArray_FILLWBYTE(out, 255)
+            if output_colorspace == TJPF_GRAY:
+                cmyk2gray(tmp_p, out_p, height*width)
+            else:
+                cmyk2color(tmp_p, out_p, height*width, output_colorspace)
+
+        # done
+        return out
 
 
 def encode_jpeg(
